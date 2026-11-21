@@ -77,5 +77,40 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 指标波动告警的投递一致性（outbox）
+
+指标波动超阈值时，按"事件落库 → 登记投递凭据 → 按投递身份发送"顺序执行，
+解决旧实现"先写质量事件再写通知、中途停下两边不一致"的问题：
+
+- `app/services/delivery_outbox.py`：通知投递登记箱。每条凭据带全局唯一
+  **投递身份（delivery_id）**，状态机为 `待投递 → 投递中 → 已投递 / 发送失败`。
+- 模拟通知网关按投递身份幂等：同一身份只产生一条实际通知，`inbox` 即实际收到的通知数。
+- 中断可区分：`投递中 + 尝试0次` 为**发送前失败**（可安全重发）；
+  `投递中 + 尝试≥1次` 为**送达后丢回执**（恢复只确认、不重发）。
+- 恢复按投递身份加锁串行：同一次波动两笔并发恢复只有一笔实际投递，另一笔复用同一份回执；
+  已送达事件重复恢复直接返回既有回执，兼容旧通知。
+- 回执回写质量事件处置清单（`投递身份/投递状态/通知编号/回执时间`），
+  告警通知按投递身份消费异常数据。
+
+接口：
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /api/metric-monitor/query` | 触发波动检测，`simulate` 可传 `fail_before_send` / `lose_receipt` 演练两种中断 |
+| `POST /api/delivery/recover/{事件编号}` | 值班员按原事件恢复投递（并发安全、幂等） |
+| `GET /api/delivery/by-incident/{事件编号}` | 查看事件持久化的投递凭据 |
+| `GET /api/delivery/box` / `GET /api/delivery/snapshot` | 投递箱清单 / 凭据状态与网关实际通知数 |
+
+前端在「质量事件管理」每行提供「处置记录」入口，抽屉里可查看凭据并提交恢复，
+恢复后自动刷新处置单。
+
+演练（先启动后端）：
+
+```bash
+backend/.venv/bin/python -I backend/demo/delivery_recovery_http.py            # 直连后端
+backend/.venv/bin/python -I backend/demo/delivery_recovery_http.py http://127.0.0.1:5173  # 经前端代理
+backend/.venv/bin/python -I backend/demo/delivery_recovery_e2e.py             # 进程内自建服务的完整演练
+```
+
 领域：数据工程
 子方向：数仓与数据湖

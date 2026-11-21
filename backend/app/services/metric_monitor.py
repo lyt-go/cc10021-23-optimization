@@ -2,18 +2,31 @@
 
 domain_chain: 指标波动检测 (metric_monitor)
   └─ 查询 → 质量事件 (dq_incident)
-  └─ 关联 → 告警通知 (dq_alert_channel)
+  └─ 登记凭据 → 通知投递箱 (notification_delivery)
+  └─ 按投递身份发送 → 告警通知 (dq_alert_channel)
   └─ 校验 → 质量评分卡 (dq_scorecard)
+
+一致性约定
+----------
+波动超阈值时按顺序执行：
+1. 质量事件落库（拿到事件编号）；
+2. 以该事件为关联键登记通知投递凭据，凭据带全局唯一投递身份；
+3. 按投递身份幂等发送，回执回写投递箱与质量事件处置清单。
+事件与凭据先于任何外部通知落库，即使发送中断，也能凭原事件编号恢复投递。
 """
 
 from __future__ import annotations
 
 import random
-import math
 from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.delivery_outbox import (
+    FAIL_NEXT_SEND,
+    LOSE_NEXT_RECEIPT,
+    DeliveryOutboxService,
+)
 from app.store import store
 
 
@@ -27,12 +40,17 @@ class MetricMonitorService(BaseModuleService):
     ACTION_RULES = {"提交校验": "待校验", "启动监控": "监控中", "停用监控": "已停用"}
     NEGATIVE_ACTIONS = ["停用监控"]
 
+    def __init__(self) -> None:
+        self.outbox = DeliveryOutboxService()
+
     def query_metric_values(self, table_name: str, metric_field: str,
-                            baseline_value: float = 0) -> dict[str, Any]:
+                            baseline_value: float = 0,
+                            fault_flags: set[str] | None = None) -> dict[str, Any]:
         """查询监控字段当前值并计算波动幅度。
 
         查询目标表中监控字段的当前统计值，与基线值对比计算波动幅度。
-        若波动超过告警阈值，自动写入质量事件并触发告警通知。
+        若波动超过告警阈值，先写入质量事件并登记投递凭据，再按投递身份
+        触发告警通知；``fault_flags`` 仅用于演练发送前中止/回执丢失。
         """
         # 查询当前值（模拟数据查询）
         current_value = baseline_value * random.uniform(0.5, 2.0) if baseline_value > 0 else random.uniform(100, 10000)
@@ -66,19 +84,26 @@ class MetricMonitorService(BaseModuleService):
             "查询时间": datetime.now(timezone.utc).isoformat(),
         }
 
-        # 若超过严重阈值：写入质量事件并触发告警
+        # 若超过严重阈值：事件落库 → 登记投递凭据 → 按投递身份发送
         if alert_level in ("critical", "warning"):
-            self._create_quality_incident(table_name, metric_field, result)
-            self._trigger_alert(table_name, metric_field, alert_level, volatility_pct)
+            incident = self._create_quality_incident(table_name, metric_field, result)
+            delivery = self._register_and_deliver(
+                table_name, metric_field, alert_level, volatility_pct,
+                incident["事件编号"], fault_flags,
+            )
+            result["事件编号"] = incident["事件编号"]
+            result["投递身份"] = delivery.get("投递身份", "")
+            result["投递状态"] = delivery.get("投递状态", "")
+            result["通知编号"] = delivery.get("通知编号", "")
 
         return result
 
     def _create_quality_incident(self, table_name: str, metric_field: str,
-                                  metric_result: dict[str, Any]) -> None:
+                                  metric_result: dict[str, Any]) -> dict[str, Any]:
         """写入质量事件记录，将指标异常事件关联到质量事件管理。"""
         incident_rows = store.rows("dq_incident")
         new_iid = max((int(r.get("id", 0)) for r in incident_rows), default=0) + 1
-        incident_rows.append({
+        incident = {
             "id": new_iid,
             "事件编号": f"DQ_I-{new_iid:04d}",
             "关联规则": f"metric_monitor:{table_name}.{metric_field}",
@@ -86,32 +111,45 @@ class MetricMonitorService(BaseModuleService):
             "偏离程度": metric_result["波动幅度"],
             "影响行数": str(random.randint(1000, 500000)),
             "严重级别": metric_result.get("告警级别", "warning"),
-            "处理状态": "新建",
+            "处理状态": "通知待投递",
             "处理人": "auto",
             "status": "待确认",
             "pending": True,
             "abnormal": True,
-        })
+        }
+        incident_rows.append(incident)
+        return incident
 
-    def _trigger_alert(self, table_name: str, field_name: str, level: str, volatility: float) -> None:
-        """触发告警通知：将波动告警关联到告警通道配置，发起通知。"""
-        alert_rows = store.rows("dq_alert_channel")
-        new_aid = max((int(r.get("id", 0)) for r in alert_rows), default=0) + 1
-        channel = "email" if level == "warning" else "phone+sms"
-        alert_rows.append({
-            "id": new_aid,
-            "配置编号": f"DQ_A-{new_aid:04d}",
-            "关联规则集": f"metric:{table_name}.{field_name}",
-            "通知方式": channel,
-            "接收人": "dq-admin",
-            "告警级别": level,
-            "静默时段": datetime.now(timezone.utc).isoformat(),
-            "聚合策略": "立即",
-            "通道状态": "已触发",
-            "status": "已生效",
-            "pending": False,
-            "abnormal": level == "critical",
-        })
+    def _register_and_deliver(self, table_name: str, field_name: str, level: str,
+                               volatility_pct: float, incident_id: str,
+                               fault_flags: set[str] | None) -> dict[str, Any]:
+        """登记投递凭据并按投递身份发送；中断后由恢复接口按事件编号续发。"""
+        channel_map = {
+            "critical": ("phone+sms", "dq-admin,dq-lead"),
+            "warning": ("email+sms", "dq-admin"),
+        }
+        notify_method, recipients = channel_map.get(level, ("email", "dq-admin"))
+        rule_set = f"metric:{table_name}.{field_name}"
+        message = f"指标 {table_name}.{field_name} 波动 {volatility_pct}% 超过告警阈值"
+
+        # 事件落库后立即登记凭据：即使下一步发送中止，凭据也已持久化可恢复。
+        credential = self.outbox.register_delivery(
+            incident_id=incident_id,
+            rule_set=rule_set,
+            severity=level,
+            message=message,
+            notify_method=notify_method,
+            recipients=recipients,
+            table_name=table_name,
+            field_name=field_name,
+        )
+        receipt = self.outbox.send_with_receipt(credential["投递身份"], fault_flags)
+        return receipt
+
+    def recover_incident_delivery(self, incident_id: str,
+                                   fault_flags: set[str] | None = None) -> dict[str, Any]:
+        """按原事件编号恢复投递：并发恢复共用同一投递身份，只确认一次实际投递。"""
+        return self.outbox.recover_by_incident(incident_id, fault_flags)
 
     def aggregate_metric_trends(self, table_name: str, days: int = 7) -> list[dict[str, Any]]:
         """聚合多日指标查询结果，生成趋势分析数据。

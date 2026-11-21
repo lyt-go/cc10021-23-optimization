@@ -20,6 +20,7 @@ from app.services.dq_alert_channel import DqAlertChannelService
 from app.services.dq_baseline import DqBaselineService
 from app.services.mdm_entity import MdmEntityService
 from app.services.dq_trend import DqTrendService
+from app.services.delivery_outbox import DeliveryOutboxService
 
 SERVICES: dict[str, BaseModuleService] = {
     "dq_rule_def": DqRuleDefService(),
@@ -40,6 +41,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "dq_baseline": DqBaselineService(),
     "mdm_entity": MdmEntityService(),
     "dq_trend": DqTrendService(),
+    "notification_delivery": DeliveryOutboxService(),
 }
 
 

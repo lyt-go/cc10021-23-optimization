@@ -60,6 +60,15 @@
             >
               {{ action }}
             </button>
+            <button
+              v-if="meta.key === 'dq_incident'"
+              class="link"
+              type="button"
+              :data-testid="`delivery-${row.id}`"
+              @click="openDelivery(row)"
+            >
+              处置记录
+            </button>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -86,6 +95,14 @@
       </form>
     </div>
 
+    <IncidentDeliveryDrawer
+      v-if="meta.key === 'dq_incident'"
+      :open="drawerOpen"
+      :incident="activeIncident"
+      @close="drawerOpen = false"
+      @recovered="reload"
+    />
+
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
@@ -103,6 +120,7 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import IncidentDeliveryDrawer from '@/views/IncidentDeliveryDrawer.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
@@ -115,6 +133,8 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const drawerOpen = ref(false)
+const activeIncident = ref<EntryRow | null>(null)
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -174,6 +194,11 @@ async function runAction(action: string, row: EntryRow) {
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '操作失败'
   }
+}
+
+function openDelivery(row: EntryRow) {
+  activeIncident.value = row
+  drawerOpen.value = true
 }
 
 async function reload() {

@@ -27,11 +27,15 @@ class DqAlertChannelService(BaseModuleService):
     NEGATIVE_ACTIONS = ["停用通道"]
 
     def dispatch_alert(self, rule_set: str, severity: str, message: str,
-                        incident_id: str = "") -> dict[str, Any]:
+                        incident_id: str = "",
+                        delivery_id: str = "") -> dict[str, Any]:
         """分发告警通知：根据告警级别选择通道和接收人，写入事件记录。
 
         查询关联的质量事件和巡检任务，聚合告警上下文后导入通知通道。
         根据严重级别决定通知方式（邮件/短信/电话）和接收人。
+
+        告警通知按投递身份（``delivery_id``）消费异常数据：同一投递身份
+        只分发一次，重复请求直接返回既有通知回执，兼容没有投递身份的旧调用。
         """
         channel_map = {
             "critical": ("phone+sms", "dq-admin,dq-lead"),
@@ -40,14 +44,33 @@ class DqAlertChannelService(BaseModuleService):
         }
         notify_method, recipients = channel_map.get(severity, ("email", "dq-admin"))
 
-        # 去重检查：静默时段内不重复发送
         all_alerts = store.rows(self.MODULE)
+
+        # 投递身份幂等：同一凭据的重复分发直接复用既有回执，不产生第二条通知。
+        if delivery_id:
+            for alert in all_alerts:
+                if alert.get("投递身份") == delivery_id:
+                    return {
+                        "通知编号": alert["配置编号"],
+                        "投递身份": delivery_id,
+                        "通知方式": alert["通知方式"],
+                        "接收人": alert["接收人"],
+                        "告警级别": alert["告警级别"],
+                        "消息摘要": message[:100],
+                        "发送时间": alert.get("静默时段", ""),
+                        "关联事件": incident_id or alert.get("关联事件", ""),
+                        "状态": "已发送",
+                        "幂等命中": True,
+                    }
+
+        # 去重检查：静默时段内不重复发送（兼容无投递身份的既有链路）
         dedup_key = f"{rule_set}:{severity}:{message[:20]}"
         recent_duplicates = [
             a for a in all_alerts
             if a.get("关联规则集") == rule_set
             and a.get("告警级别") == severity
             and a.get("status") == "已生效"
+            and not a.get("投递身份")
         ]
         if recent_duplicates:
             return {
@@ -61,6 +84,7 @@ class DqAlertChannelService(BaseModuleService):
         entry = {
             "id": new_id,
             "配置编号": f"DQ_A-{new_id:04d}",
+            "投递身份": delivery_id,
             "关联规则集": rule_set,
             "通知方式": notify_method,
             "接收人": recipients,
@@ -68,6 +92,7 @@ class DqAlertChannelService(BaseModuleService):
             "静默时段": datetime.now(timezone.utc).isoformat(),
             "聚合策略": "立即" if severity in ("critical", "warning") else "聚合",
             "通道状态": "已发送",
+            "关联事件": incident_id,
             "status": "已生效",
             "pending": False,
             "abnormal": severity in ("critical", "warning"),
@@ -76,11 +101,12 @@ class DqAlertChannelService(BaseModuleService):
 
         return {
             "通知编号": entry["配置编号"],
+            "投递身份": delivery_id,
             "通知方式": notify_method,
             "接收人": recipients,
             "告警级别": severity,
             "消息摘要": message[:100],
-            "发送时间": datetime.now(timezone.utc).isoformat(),
+            "发送时间": entry["静默时段"],
             "关联事件": incident_id,
             "状态": "已发送",
         }
